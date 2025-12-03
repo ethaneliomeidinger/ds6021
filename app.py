@@ -219,6 +219,25 @@ def run_hypergraph_demo(data_root: str):
 
     return metrics, preview
 
+import torch.nn as nn
+
+class GraphSageWrapper(nn.Module):
+    def __init__(self, in_feats, hidden_dim=64, out_dim=32, num_layers=2, dropout=0.1):
+        super().__init__()
+        self.gnn = GraphSAGEEncoder(
+            in_feats=in_feats,
+            hidden_dim=hidden_dim,
+            out_dim=out_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
+
+    def forward(self, g):
+        # Node features were stored in dataset.build_graph as ndata['feat']
+        x = g.ndata['feat']  # (total_nodes_in_batch, in_feats)
+        return self.gnn(g, x)  # returns (batch_size, out_dim) via dgl.mean_nodes
+
+
 
 # -----------------------------------------------------------
 # Dash app
