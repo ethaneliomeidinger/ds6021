@@ -1,5 +1,5 @@
-import os
 import json
+import os
 
 import numpy as np
 import pandas as pd
@@ -9,10 +9,14 @@ import plotly.graph_objects as go
 
 import benchmark as bm
 
-# --- NEW: bring in your PyTorch fusion stack ---
+# NEW: PyTorch + DGL-based stuff
 import torch
-from hyperfusion import HypergraphFusion, HyperCoCoFusion
-from encoders import DummyEncoder, MLPEncoder
+from torch.utils.data import DataLoader
+
+from encoders import GraphSAGEEncoder, DummyEncoder
+from hyperfusion import HyperCoCoFusion
+from dataset import MultimodalDGLDataset, multimodal_dgl_collate_fn
+
 
 
 def run_all_models(
