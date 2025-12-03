@@ -36,7 +36,86 @@ class GraphSageWrapper(nn.Module):
         x = g.ndata['feat']  # (total_nodes_in_batch, in_feats)
         return self.gnn(g, x)  # returns (batch_size, out_dim) via dgl.mean_nodes
 
+class PullX(nn.Module):
+    """Wrap a (g, x) graph encoder so it works with just (g)."""
+    def __init__(self, base_encoder: nn.Module):
+        super().__init__()
+        self.base = base_encoder
 
+    def forward(self, g):
+        # prefer 'x'; fall back to 'feat'
+        if "x" in g.ndata:
+            x = g.ndata["x"]
+        elif "feat" in g.ndata:
+            x = g.ndata["feat"]
+            g.ndata["x"] = x
+        else:
+            raise KeyError("Graph is missing node features: need g.ndata['x'] or ['feat'].")
+        return self.base(g, x)
+
+
+class FeatureAdapter(nn.Module):
+    """Wrap a feature-only encoder so it accepts a single tensor argument."""
+    def __init__(self, feat_encoder: nn.Module):
+        super().__init__()
+        self.feat_encoder = feat_encoder
+
+    def forward(self, x):
+        return self.feat_encoder(x)
+
+
+def normalize_graph_inplace(g, feat_key_src="feat", feat_key_dst="x"):
+    """
+    Copy node feats from feat_key_src -> feat_key_dst if needed, then
+    apply signed log1p + z-score + clipping (like your training script).
+    """
+    if feat_key_dst not in g.ndata:
+        if feat_key_src in g.ndata:
+            g.ndata[feat_key_dst] = g.ndata[feat_key_src]
+        else:
+            raise KeyError("Graph is missing node feats: need ndata['x'] or ndata['feat'].")
+
+    x = g.ndata[feat_key_dst].float()
+    x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # signed log1p
+    x = x.sign() * torch.log1p(x.abs())
+
+    mean = x.mean(dim=0, keepdim=True)
+    std = x.std(dim=0, keepdim=True).clamp_min(1e-6)
+    x = (x - mean) / std
+    x = x.clamp_(-8.0, 8.0)
+
+    g.ndata[feat_key_dst] = x
+    return g
+
+
+def _build_encoder(encoder_name: str, D: int, cmsi_dim: int, morph_in: int):
+    """
+    Build encoders exactly like your training script:
+      - graph encoder: GAT / GraphSAGE / GIN (we'll use 'gsage' in the Dash demo)
+      - morph encoder: DummyEncoder over (B, R, d)
+    """
+    import encoders as encoders1  # to match your script’s namespace
+
+    if encoder_name == "gin":
+        enc_fc_base = encoders1.GINEncoder(in_feats=D, out_dim=cmsi_dim)
+        enc_sc_base = encoders1.GINEncoder(in_feats=D, out_dim=cmsi_dim)
+    elif encoder_name == "gsage":
+        enc_fc_base = encoders1.GraphSAGEEncoder(in_feats=D, out_dim=cmsi_dim)
+        enc_sc_base = encoders1.GraphSAGEEncoder(in_feats=D, out_dim=cmsi_dim)
+    else:  # "gat"
+        enc_fc_base = encoders1.GATEncoder(in_feats=D, out_dim=cmsi_dim)
+        enc_sc_base = encoders1.GATEncoder(in_feats=D, out_dim=cmsi_dim)
+
+    # morph_in is the last dim of morph: (B, R, d) → d
+    enc_morph_base = encoders1.DummyEncoder(in_dim=morph_in, out_dim=cmsi_dim)
+
+    encoder_fc = PullX(enc_fc_base)
+    encoder_sc = PullX(enc_sc_base)
+    encoder_morph = FeatureAdapter(enc_morph_base)
+
+    return encoder_fc, encoder_sc, encoder_morph
 
 def run_all_models(
     data_root: str,
@@ -152,128 +231,151 @@ def load_modalities(data_root: str):
         morph_flat = morph_t
 
     return fc_t, sc_t, morph_flat, cog_t, labels_t
+import random
+
+def _split_indices(n, seed=42, train_ratio=0.7, val_ratio=0.15):
+    idx = list(range(n))
+    rng = random.Random(seed)
+    rng.shuffle(idx)
+    n_train = int(n * train_ratio)
+    n_val   = int(n * val_ratio)
+    train_idx = idx[:n_train]
+    val_idx   = idx[n_train:n_train+n_val]
+    test_idx  = idx[n_train+n_val:]
+    return train_idx, val_idx, test_idx
 
 
-def run_hypergraph_demo(data_root: str):
+@torch.no_grad()
+def _evaluate(model, dl, device):
+    model.eval()
+    crit = torch.nn.MSELoss()
+    total, count = 0.0, 0
+    for g_fc, g_sc, morph, cog, labels in dl:
+        normalize_graph_inplace(g_fc)
+        normalize_graph_inplace(g_sc)
+        morph, cog, labels = morph.to(device), cog.to(device), labels.to(device)
+        out = model(g_fc, g_sc, morph, cog)
+        loss = crit(out, labels)
+        if torch.isfinite(loss):
+            total += loss.item()
+            count += 1
+    return float("nan") if count == 0 else total / count
+
+
+def _train_hypergraph(model, train_dl, val_dl, device, epochs=15, lr=1e-4):
+    crit = torch.nn.MSELoss()
+    opt  = torch.optim.Adam(model.parameters(), lr=lr)
+
+    train_hist, val_hist = [], []
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        running, batches = 0.0, 0
+
+        for g_fc, g_sc, morph, cog, labels in train_dl:
+            normalize_graph_inplace(g_fc)
+            normalize_graph_inplace(g_sc)
+            morph, cog, labels = morph.to(device), cog.to(device), labels.to(device)
+
+            opt.zero_grad(set_to_none=True)
+            out  = model(g_fc, g_sc, morph, cog)
+            loss = crit(out, labels)
+            if not torch.isfinite(loss):
+                continue
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+
+            running += loss.item()
+            batches += 1
+
+        train_loss = float("nan") if batches == 0 else running / batches
+        val_loss   = _evaluate(model, val_dl, device)
+
+        train_hist.append(train_loss)
+        val_hist.append(val_loss)
+
+    return train_hist, val_hist
+
+
+def run_hypergraph_demo(data_root: str) -> str:
     """
-    Single forward pass of HyperCoCoFusion using your MultimodalDGLDataset
-    (DGL graphs for FC/SC + morph + cog + labels).
-
-    Returns metrics + a small preview of predictions vs labels.
+    Run a single forward pass of HyperCoCoFusion on a small batch, using the
+    same wiring as your standalone training script.
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")
 
-    # 1) Build dataset & one DataLoader
-    ds = MultimodalDGLDataset(root_dir=data_root, threshold=0.0, mode='topk', k=30)
-    batch_size = min(32, len(ds))
-    dl = DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=multimodal_dgl_collate_fn,
-        num_workers=0,
-    )
+    # 1) Build a small DGL multimodal dataset
+    ds = MultimodalDGLDataset(root_dir=data_root, threshold=0.0, mode="topk", k=30)
+    dl = DataLoader(ds, batch_size=16, shuffle=False, collate_fn=multimodal_dgl_collate_fn)
 
-    # Take the first batch
-    g_fc, g_sc, morph, cog, labels = next(iter(dl))
+    try:
+        g_fc, g_sc, morph, cog, labels = next(iter(dl))
+    except StopIteration:
+        raise RuntimeError("Dataset appears to be empty; check your data_root path.")
+
+    # 2) Move to device & normalize graphs
     g_fc = g_fc.to(device)
     g_sc = g_sc.to(device)
-    morph = morph.to(device)   # (B, D, d)
-    cog = cog.to(device)       # (B, l)
-    labels = labels.to(device) # (B, c)
+    normalize_graph_inplace(g_fc)
+    normalize_graph_inplace(g_sc)
 
-    B = labels.size(0)
-    d_cog = cog.size(-1)
-    label_dim = labels.size(-1)
+    morph = morph.to(device)   # (B, R, d)
+    cog   = cog.to(device)     # (B, l)
+    labels = labels.to(device) # (B, C)
 
-    # 2) Build encoders
+    # 3) Infer dims exactly like in your script
+    if "x" not in g_fc.ndata and "feat" in g_fc.ndata:
+        g_fc.ndata["x"] = g_fc.ndata["feat"]
+    if "x" not in g_sc.ndata and "feat" in g_sc.ndata:
+        g_sc.ndata["x"] = g_sc.ndata["feat"]
+
+    D        = g_fc.ndata["x"].shape[-1]   # node feature dim
+    morph_in = morph.shape[-1]             # d
+    vwv_d    = cog.shape[-1]               # cognitive dim
+    C        = labels.shape[-1]            # # labels
     cmsi_dim = 32
 
-    # Node feature dimension (we stored conn_matrix as node feature in dataset.py)
-    in_feats = g_fc.ndata["feat"].shape[-1]
+    # 4) Build encoders like _build_encoder('gsage', ...)
+    encoder_fc, encoder_sc, encoder_morph = _build_encoder(
+        encoder_name="gsage",
+        D=D,
+        cmsi_dim=cmsi_dim,
+        morph_in=morph_in,
+    )
 
-    encoder_fc = GraphSageWrapper(
-        in_feats=in_feats,
-        hidden_dim=64,
-        out_dim=cmsi_dim,
-        num_layers=2,
-        dropout=0.1,
-    ).to(device)
+    encoder_fc.to(device)
+    encoder_sc.to(device)
+    encoder_morph.to(device)
 
-    encoder_sc = GraphSageWrapper(
-        in_feats=in_feats,
-        hidden_dim=64,
-        out_dim=cmsi_dim,
-        num_layers=2,
-        dropout=0.1,
-    ).to(device)
-
-    # Morph encoder: use DummyEncoder on a flattened morph vector
-    morph_flat = morph.view(B, -1)  # (B, D*d)
-    encoder_morph = DummyEncoder(
-        in_dim=morph_flat.shape[-1],
-        out_dim=cmsi_dim,
-    ).to(device)
-
-    # 3) Build HyperCoCoFusion model reusing your existing hyperfusion.py
+    # 5) HyperCoCoFusion model (same options as your main script)
     model = HyperCoCoFusion(
         encoder_fc=encoder_fc,
         encoder_sc=encoder_sc,
         encoder_morph=encoder_morph,
         cmsi_d=cmsi_dim,
-        vwv_d=d_cog,
-        label_dim=label_dim,
+        vwv_d=vwv_d,
+        label_dim=C,
         cmsi_method="cross_attention",
         info_theory=False,
-        vwv_riemann=False,
+        vwv_riemann=True,
         use_spectral_hypergraph=True,
-        use_residual=True,
+        use_residual=False,
     ).to(device)
 
-    # 4) Forward pass
     model.eval()
     with torch.no_grad():
-        preds = model(g_fc, g_sc, morph_flat, cog)  # (B, c)
+        preds = model(g_fc, g_sc, morph, cog)
+        mse = torch.mean((preds - labels) ** 2).item()
 
-    # 5) Compute simple regression metrics
-    y_true = labels.cpu().numpy()
-    y_pred = preds.cpu().numpy()
-
-    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-
-    mse = float(mean_squared_error(y_true, y_pred))
-    mae = float(mean_absolute_error(y_true, y_pred))
-    try:
-        r2 = float(r2_score(y_true, y_pred))
-    except ValueError:
-        r2 = float("nan")
-
-    metrics = {
-        "mse": mse,
-        "mae": mae,
-        "r2": r2,
-        "batch_size": int(B),
-        "cmsi_dim": int(cmsi_dim),
-        "cog_dim": int(d_cog),
-        "label_dim": int(label_dim),
-        "device": str(device),
-    }
-
-    # Preview first few rows
-    preview = []
-    for i in range(min(5, B)):
-        preview.append(
-            {
-                "idx": int(i),
-                "y_true": y_true[i].tolist(),
-                "y_pred": y_pred[i].tolist(),
-            }
-        )
-
-    return metrics, preview
+    summary = (
+        f"HyperCoCoFusion forward pass OK.\n"
+        f"preds shape: {tuple(preds.shape)}\n"
+        f"MSE on this mini-batch: {mse:.4f}"
+    )
+    return summary
 
 
-import torch.nn as nn
 
 
 # -----------------------------------------------------------
@@ -352,10 +454,6 @@ def readme_layout():
                     html.Li("K-Means cluster-mean regression (unsupervised features + cluster-wise label means)"),
                     html.Li("HyperCoCoFusion (spectral hypergraph + CMSI, demo tab)"),
                 ]
-            ),
-            html.P(
-                "You can plug in new methods by adding a new run_XXX function in "
-                "benchmark.py and registering it in the Dash callbacks."
             ),
         ],
     )
@@ -530,24 +628,45 @@ def hypergraph_layout():
         children=[
             html.H3("Hypergraph Fusion Demo (HyperCoCoFusion)"),
             html.P(
-                "This tab runs a single forward pass of your HyperCoCoFusion model "
-                "on the same simulated_data (fc/sc/morph/cog/labels) to verify that "
-                "CMSI, VWV, and spectral hypergraph fusion all compose correctly."
+                "This tab trains HyperCoCoFusion for a small number of epochs "
+                "on the simulated multimodal dataset (fc/sc/morph/cog/labels)."
             ),
-            html.Label("Data root (same folder as above, with fc.npy/sc.npy/morph.npy/cog.npy/labels.npy)"),
+
+            html.Label("Data root (folder with fc.npy/sc.npy/morph.npy/cog.npy/labels.npy)"),
             dcc.Input(
-                id="hg-data-root",
+                id="hyper-data-root",
                 type="text",
                 value="simulated_data",
                 style={"width": "100%"},
             ),
+            html.Br(), html.Br(),
+
+            html.Label("Training epochs"),
+            dcc.Slider(
+                id="hyper-epochs",
+                min=1, max=30, step=1, value=15,
+                marks={1: "1", 5: "5", 15: "15", 30: "30"},
+            ),
             html.Br(),
-            html.Br(),
-            html.Button("Run Hypergraph Forward Pass", id="hg-run-btn", n_clicks=0),
-            html.Div(id="hg-metrics", style={"marginTop": "20px"}),
-            html.Div(id="hg-preview", style={"marginTop": "10px"}),
+
+            html.Button("Train Hypergraph Model", id="hyper-train-btn", n_clicks=0),
+
+            html.Div(
+                id="hyper-status",
+                style={
+                    "whiteSpace": "pre-wrap",
+                    "fontFamily": "monospace",
+                    "marginTop": "12px",
+                    "color": "#333",
+                },
+            ),
+
+            html.Hr(),
+            html.H4("Training vs Validation Loss (MSE)"),
+            dcc.Graph(id="hyper-loss-fig"),
         ],
     )
+
 
 
 # -----------------------------------------------------------
@@ -674,72 +793,114 @@ def on_run_click(
 
 # -----------------------------------------------------------
 # Callback: run Hypergraph Fusion demo
-# -----------------------------------------------------------
+# ----------------------------------------------------------
 @app.callback(
-    Output("hg-metrics", "children"),
-    Output("hg-preview", "children"),
-    Input("hg-run-btn", "n_clicks"),
-    State("hg-data-root", "value"),
+    Output("hyper-status", "children"),
+    Output("hyper-loss-fig", "figure"),
+    Input("hyper-train-btn", "n_clicks"),
+    State("hyper-data-root", "value"),
+    State("hyper-epochs", "value"),
     prevent_initial_call=True,
 )
-def on_hg_run(n_clicks, data_root):
+def train_hypergraph_callback(n_clicks, data_root, epochs):
     try:
-        metrics, preview = run_hypergraph_demo(data_root)
+        device = torch.device("cpu")
+
+        # 1) Dataset + splits
+        full_ds = MultimodalDGLDataset(root_dir=data_root, threshold=0.0, mode="topk", k=30)
+        N = len(full_ds)
+        train_idx, val_idx, test_idx = _split_indices(N, seed=301, train_ratio=0.7, val_ratio=0.15)
+
+        train_ds = torch.utils.data.Subset(full_ds, train_idx)
+        val_ds   = torch.utils.data.Subset(full_ds, val_idx)
+        test_ds  = torch.utils.data.Subset(full_ds, test_idx)
+
+        train_dl = DataLoader(train_ds, batch_size=32, shuffle=True,
+                              collate_fn=multimodal_dgl_collate_fn)
+        val_dl   = DataLoader(val_ds,   batch_size=32, shuffle=False,
+                              collate_fn=multimodal_dgl_collate_fn)
+        test_dl  = DataLoader(test_ds,  batch_size=32, shuffle=False,
+                              collate_fn=multimodal_dgl_collate_fn)
+
+        # 2) Peek at one batch to infer dims
+        g_fc_b, g_sc_b, morph_b, cog_b, labels_b = next(iter(train_dl))
+        if "x" not in g_fc_b.ndata and "feat" in g_fc_b.ndata:
+            g_fc_b.ndata["x"] = g_fc_b.ndata["feat"]
+        if "x" not in g_sc_b.ndata and "feat" in g_sc_b.ndata:
+            g_sc_b.ndata["x"] = g_sc_b.ndata["feat"]
+
+        D        = g_fc_b.ndata["x"].shape[-1]   # node feature dim
+        morph_in = morph_b.shape[-1]             # per-ROI morph dim
+        vwv_d    = cog_b.shape[-1]               # cognitive dim
+        C        = labels_b.shape[-1]            # labels
+        cmsi_dim = 32
+
+        # 3) Build encoders and model (GraphSAGE version)
+        encoder_fc, encoder_sc, encoder_morph = _build_encoder(
+            encoder_name="gsage",
+            D=D,
+            cmsi_dim=cmsi_dim,
+            morph_in=morph_in,
+        )
+        encoder_fc.to(device)
+        encoder_sc.to(device)
+        encoder_morph.to(device)
+
+        model = HyperCoCoFusion(
+            encoder_fc=encoder_fc,
+            encoder_sc=encoder_sc,
+            encoder_morph=encoder_morph,
+            cmsi_d=cmsi_dim,
+            vwv_d=vwv_d,
+            label_dim=C,
+            cmsi_method="cross_attention",
+            info_theory=False,
+            vwv_riemann=True,
+            use_spectral_hypergraph=True,
+            use_residual=False,
+        ).to(device)
+
+        # 4) Train for the requested number of epochs
+        train_hist, val_hist = _train_hypergraph(
+            model, train_dl, val_dl, device, epochs=int(epochs), lr=1e-4
+        )
+
+        # 5) Final test loss
+        test_loss = _evaluate(model, test_dl, device)
+
+        status = (
+            f"Trained HyperCoCoFusion for {epochs} epochs on {data_root}.\n"
+            f"Train loss (last epoch): {train_hist[-1]:.4f}\n"
+            f"Val loss   (last epoch): {val_hist[-1]:.4f}\n"
+            f"Test loss              : {test_loss:.4f}"
+        )
+
+        # 6) Build loss curve figure
+        fig = go.Figure()
+        fig.add_scatter(
+            x=list(range(1, len(train_hist)+1)),
+            y=train_hist,
+            mode="lines+markers",
+            name="train",
+        )
+        fig.add_scatter(
+            x=list(range(1, len(val_hist)+1)),
+            y=val_hist,
+            mode="lines+markers",
+            name="val",
+        )
+        fig.update_layout(
+            xaxis_title="Epoch",
+            yaxis_title="MSE loss",
+            legend_title="Split",
+        )
+
+        return status, fig
+
     except Exception as e:
-        return (
-            html.Div(f"Error in HyperCoCoFusion demo: {e}", style={"color": "red"}),
-            html.Div(),
-        )
+        err_fig = go.Figure()
+        return f"Error while training HyperCoCoFusion: {e}", err_fig
 
-    metrics_table = html.Table(
-        [
-            html.Tr([html.Th("Metric"), html.Th("Value")])
-        ]
-        + [
-            html.Tr([html.Td(k), html.Td(str(v))])
-            for k, v in metrics.items()
-        ]
-    )
-
-    preview_rows = []
-    for row in preview:
-        preview_rows.append(
-            html.Tr(
-                [
-                    html.Td(row["idx"]),
-                    html.Td(json.dumps(row["y_true"])),
-                    html.Td(json.dumps(row["y_pred"])),
-                ]
-            )
-        )
-
-    preview_table = html.Table(
-        [
-            html.Tr(
-                [
-                    html.Th("idx"),
-                    html.Th("y_true"),
-                    html.Th("y_pred"),
-                ]
-            )
-        ]
-        + preview_rows
-    )
-
-    return (
-        html.Div(
-            [
-                html.H4("HyperCoCoFusion Forward-Pass Metrics"),
-                metrics_table,
-            ]
-        ),
-        html.Div(
-            [
-                html.H4("First 5 Predictions vs True"),
-                preview_table,
-            ]
-        ),
-    )
 
 
 # -----------------------------------------------------------
