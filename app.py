@@ -11,6 +11,7 @@ import benchmark as bm
 
 # NEW: PyTorch + DGL-based stuff
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from encoders import GraphSAGEEncoder, DummyEncoder
