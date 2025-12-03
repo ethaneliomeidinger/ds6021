@@ -1,3 +1,4 @@
+import os
 import json
 
 import numpy as np
@@ -6,7 +7,12 @@ import pandas as pd
 from dash import Dash, dcc, html, dash_table, Input, Output, State
 import plotly.graph_objects as go
 
-import benchmark as bm  
+import benchmark as bm
+
+# --- NEW: bring in your PyTorch fusion stack ---
+import torch
+from hyperfusion import HypergraphFusion, HyperCoCoFusion
+from encoders import DummyEncoder, MLPEncoder
 
 
 def run_all_models(
@@ -21,6 +27,7 @@ def run_all_models(
     kmeans_k: int,
 ):
     """
+    Orchestrate all sklearn baselines on concatenated features.
 
       - load_concatenated_features
       - make_splits
@@ -31,6 +38,8 @@ def run_all_models(
 
     Returns:
       results: dict[model_name -> result_dict]
+      X_shape: tuple
+      y_shape: tuple
     """
     np.random.seed(seed)
 
@@ -83,10 +92,137 @@ def run_all_models(
     return results, X.shape, y.shape
 
 
+# -----------------------------------------------------------
+# Helper: load raw modality npys (for HyperCoCoFusion demo)
+# -----------------------------------------------------------
+def load_modalities(data_root: str):
+    """
+    Load fc, sc, morph, cog, labels from data_root/simulated_data-style folder.
+    Returns tensors on CPU.
+    """
+    def _np(path):
+        arr = np.load(path)
+        return arr
 
+    fc = _np(os.path.join(data_root, "fc.npy"))       # (N, D_fc, D_fc)
+    sc = _np(os.path.join(data_root, "sc.npy"))       # (N, D_sc, D_sc)
+    morph = _np(os.path.join(data_root, "morph.npy")) # (N, ..., ...)
+    cog = _np(os.path.join(data_root, "cog.npy"))     # (N, d_cog)
+    labels = _np(os.path.join(data_root, "labels.npy"))
+
+    # Coerce labels to (N, C)
+    if labels.ndim == 1:
+        labels = labels.reshape(-1, 1)
+
+    # Convert to float tensors
+    fc_t = torch.from_numpy(fc).float()
+    sc_t = torch.from_numpy(sc).float()
+    morph_t = torch.from_numpy(morph).float()
+    cog_t = torch.from_numpy(cog).float()
+    labels_t = torch.from_numpy(labels).float()
+
+    # Flatten morph if it's 3D so MLP sees (N, D)
+    N = morph_t.shape[0]
+    if morph_t.ndim > 2:
+        morph_flat = morph_t.view(N, -1)
+    else:
+        morph_flat = morph_t
+
+    return fc_t, sc_t, morph_flat, cog_t, labels_t
+
+
+def run_hypergraph_demo(data_root: str):
+    """
+    Single forward pass of HyperCoCoFusion on your simulated_data.
+    No training, just to synthesize encoders + hypergraph + VWV + CMSI.
+    Returns a small metrics dict + shape info.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    fc, sc, morph, cog, labels = load_modalities(data_root)
+    fc = fc.to(device)
+    sc = sc.to(device)
+    morph = morph.to(device)
+    cog = cog.to(device)
+    labels = labels.to(device)
+
+    N = fc.shape[0]
+    d_cog = cog.shape[-1]
+    label_dim = labels.shape[-1]
+
+    cmsi_dim = 32
+
+    # Simple encoders:
+    # FC / SC: DummyEncoder over last dimension (averages over nodes)
+    encoder_fc = DummyEncoder(in_dim=fc.shape[-1], out_dim=cmsi_dim).to(device)
+    encoder_sc = DummyEncoder(in_dim=sc.shape[-1], out_dim=cmsi_dim).to(device)
+    # Morph: MLP over flattened morph features
+    encoder_morph = MLPEncoder(input_dim=morph.shape[-1],
+                               hidden_dims=[128, 64],
+                               output_dim=cmsi_dim).to(device)
+
+    model = HyperCoCoFusion(
+        encoder_fc=encoder_fc,
+        encoder_sc=encoder_sc,
+        encoder_morph=encoder_morph,
+        cmsi_d=cmsi_dim,
+        vwv_d=d_cog,
+        label_dim=label_dim,
+        cmsi_method='cross_attention',
+        info_theory=False,
+        vwv_riemann=False,
+        use_spectral_hypergraph=True,
+        use_residual=True,
+    ).to(device)
+
+    model.eval()
+    with torch.no_grad():
+        preds = model(fc, sc, morph, cog)  # (N, C)
+
+    # Simple regression metrics
+    y_true = labels.cpu().numpy()
+    y_pred = preds.cpu().numpy()
+
+    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+    mse = float(mean_squared_error(y_true, y_pred))
+    mae = float(mean_absolute_error(y_true, y_pred))
+    try:
+        r2 = float(r2_score(y_true, y_pred))
+    except ValueError:
+        # e.g., constant labels
+        r2 = float("nan")
+
+    metrics = {
+        "mse": mse,
+        "mae": mae,
+        "r2": r2,
+        "N": int(N),
+        "label_dim": int(label_dim),
+        "cmsi_dim": int(cmsi_dim),
+        "cog_dim": int(d_cog),
+        "device": str(device),
+    }
+
+    # Show first few preds vs true
+    preview = []
+    for i in range(min(5, N)):
+        preview.append({
+            "idx": i,
+            "y_true": y_true[i].tolist(),
+            "y_pred": y_pred[i].tolist(),
+        })
+
+    return metrics, preview
+
+
+# -----------------------------------------------------------
 # Dash app
+# -----------------------------------------------------------
 
 app = Dash(__name__)
+# Expose underlying Flask server for Gunicorn / hosting platforms
+server = app.server
 app.title = "HCP-D Brain Imaging Benchmarks"
 
 
@@ -100,6 +236,7 @@ app.layout = html.Div(
             children=[
                 dcc.Tab(label="README", value="tab-readme"),
                 dcc.Tab(label="Baseline Benchmarks", value="tab-benchmarks"),
+                dcc.Tab(label="Hypergraph Fusion Demo", value="tab-hypergraph"),
             ],
         ),
         html.Div(id="tab-content"),
@@ -116,6 +253,8 @@ def render_tab(tab):
         return readme_layout()
     elif tab == "tab-benchmarks":
         return benchmark_layout()
+    elif tab == "tab-hypergraph":
+        return hypergraph_layout()
     return html.Div("Unknown tab selected.")
 
 
@@ -151,6 +290,7 @@ def readme_layout():
                     html.Li("Support Vector Regression (SVR; RBF kernel)"),
                     html.Li("K-Nearest Neighbors regression"),
                     html.Li("K-Means cluster-mean regression (unsupervised features + cluster-wise label means)"),
+                    html.Li("HyperCoCoFusion (spectral hypergraph + CMSI, demo tab)"),
                 ]
             ),
             html.P(
@@ -181,11 +321,11 @@ def benchmark_layout():
                             dcc.Input(
                                 id="data-root",
                                 type="text",
-                                value="./sim_data",  # <--- change this to your simulated data path
+                                value="simulated_data",  # default: repo folder
                                 style={"width": "100%"},
                             ),
                             html.Small(
-                                "Update this path to point to your simulated HCP-D features.",
+                                "Update this path if your .npy files live somewhere else (relative to app root).",
                                 style={"display": "block", "marginTop": "4px"},
                             ),
                         ],
@@ -200,7 +340,7 @@ def benchmark_layout():
                                 max=0.3,
                                 step=0.05,
                                 value=0.15,
-                                marks={v: f"{int(v*100)}%" for v in np.arange(0.05, 0.35, 0.05)},
+                                marks={float(v): f"{int(v*100)}%" for v in np.arange(0.05, 0.35, 0.05)},
                             ),
                         ],
                     ),
@@ -214,7 +354,7 @@ def benchmark_layout():
                                 max=0.3,
                                 step=0.05,
                                 value=0.15,
-                                marks={v: f"{int(v*100)}%" for v in np.arange(0.05, 0.35, 0.05)},
+                                marks={float(v): f"{int(v*100)}%" for v in np.arange(0.05, 0.35, 0.05)},
                             ),
                         ],
                     ),
@@ -342,6 +482,35 @@ def benchmark_layout():
 
 
 # -----------------------------------------------------------
+# Hypergraph Fusion tab layout
+# -----------------------------------------------------------
+def hypergraph_layout():
+    return html.Div(
+        style={"maxWidth": "900px"},
+        children=[
+            html.H3("Hypergraph Fusion Demo (HyperCoCoFusion)"),
+            html.P(
+                "This tab runs a single forward pass of your HyperCoCoFusion model "
+                "on the same simulated_data (fc/sc/morph/cog/labels) to verify that "
+                "CMSI, VWV, and spectral hypergraph fusion all compose correctly."
+            ),
+            html.Label("Data root (same folder as above, with fc.npy/sc.npy/morph.npy/cog.npy/labels.npy)"),
+            dcc.Input(
+                id="hg-data-root",
+                type="text",
+                value="simulated_data",
+                style={"width": "100%"},
+            ),
+            html.Br(),
+            html.Br(),
+            html.Button("Run Hypergraph Forward Pass", id="hg-run-btn", n_clicks=0),
+            html.Div(id="hg-metrics", style={"marginTop": "20px"}),
+            html.Div(id="hg-preview", style={"marginTop": "10px"}),
+        ],
+    )
+
+
+# -----------------------------------------------------------
 # Callback: run baselines
 # -----------------------------------------------------------
 @app.callback(
@@ -386,7 +555,6 @@ def on_run_click(
             kmeans_k=int(kmeans_k),
         )
     except Exception as e:
-        # In case the path is wrong or files missing, show error
         error_msg = f"Error running models: {e}"
         empty_fig = go.Figure()
         return html.Div(error_msg, style={"color": "red"}), empty_fig, "", ""
@@ -443,10 +611,13 @@ def on_run_click(
     unsup = km_res.get("unsupervised_metrics", {})
     inertia = unsup.get("inertia", None)
     silhouette = unsup.get("silhouette_train", None)
-    kmeans_text = (
-        f"Inertia: {inertia:.4f}\nSilhouette (train): "
-        f"{'nan' if silhouette is None else f'{silhouette:.4f}'}"
-    )
+    if inertia is None:
+        kmeans_text = "KMeans diagnostics not available."
+    else:
+        kmeans_text = (
+            f"Inertia: {inertia:.4f}\nSilhouette (train): "
+            f"{'nan' if silhouette is None else f'{silhouette:.4f}'}"
+        )
 
     # -------------------------------
     # Dataset info
@@ -462,8 +633,78 @@ def on_run_click(
 
 
 # -----------------------------------------------------------
+# Callback: run Hypergraph Fusion demo
+# -----------------------------------------------------------
+@app.callback(
+    Output("hg-metrics", "children"),
+    Output("hg-preview", "children"),
+    Input("hg-run-btn", "n_clicks"),
+    State("hg-data-root", "value"),
+    prevent_initial_call=True,
+)
+def on_hg_run(n_clicks, data_root):
+    try:
+        metrics, preview = run_hypergraph_demo(data_root)
+    except Exception as e:
+        return (
+            html.Div(f"Error in HyperCoCoFusion demo: {e}", style={"color": "red"}),
+            html.Div(),
+        )
+
+    metrics_table = html.Table(
+        [
+            html.Tr([html.Th("Metric"), html.Th("Value")])
+        ]
+        + [
+            html.Tr([html.Td(k), html.Td(str(v))])
+            for k, v in metrics.items()
+        ]
+    )
+
+    preview_rows = []
+    for row in preview:
+        preview_rows.append(
+            html.Tr(
+                [
+                    html.Td(row["idx"]),
+                    html.Td(json.dumps(row["y_true"])),
+                    html.Td(json.dumps(row["y_pred"])),
+                ]
+            )
+        )
+
+    preview_table = html.Table(
+        [
+            html.Tr(
+                [
+                    html.Th("idx"),
+                    html.Th("y_true"),
+                    html.Th("y_pred"),
+                ]
+            )
+        ]
+        + preview_rows
+    )
+
+    return (
+        html.Div(
+            [
+                html.H4("HyperCoCoFusion Forward-Pass Metrics"),
+                metrics_table,
+            ]
+        ),
+        html.Div(
+            [
+                html.H4("First 5 Predictions vs True"),
+                preview_table,
+            ]
+        ),
+    )
+
+
+# -----------------------------------------------------------
 # Main
 # -----------------------------------------------------------
 if __name__ == "__main__":
-    # When you’re ready to deploy, set debug=False
-    app.run_server(debug=True)
+    # For local dev; hosting platforms usually call `server` via Gunicorn.
+    app.run(debug=True, host="0.0.0.0", port=8050)
