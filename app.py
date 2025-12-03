@@ -514,26 +514,6 @@ def benchmark_layout():
 
             html.Hr(),
 
-            html.Div(
-                style={"display": "flex", "gap": "40px", "flexWrap": "wrap"},
-                children=[
-                    html.Div(
-                        style={"flex": "1 1 400px"},
-                        children=[
-                            html.H4("Performance Metrics (MSE, MAE, R²)"),
-                            html.Div(id="metrics-table"),
-                        ],
-                    ),
-                    html.Div(
-                        style={"flex": "1 1 400px"},
-                        children=[
-                            html.H4("R² by Model and Split"),
-                            dcc.Graph(id="r2-figure"),
-                        ],
-                    ),
-                ],
-            ),
-
             html.Hr(),
             html.H4("KMeans Unsupervised Diagnostics"),
             html.Pre(id="kmeans-info", style={"whiteSpace": "pre-wrap"}),
