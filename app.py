@@ -18,6 +18,23 @@ from hyperfusion import HyperCoCoFusion
 from dataset import MultimodalDGLDataset, multimodal_dgl_collate_fn
 
 
+class GraphSageWrapper(nn.Module):
+    def __init__(self, in_feats, hidden_dim=64, out_dim=32, num_layers=2, dropout=0.1):
+        super().__init__()
+        self.gnn = GraphSAGEEncoder(
+            in_feats=in_feats,
+            hidden_dim=hidden_dim,
+            out_dim=out_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
+
+    def forward(self, g):
+        # Node features were stored in dataset.build_graph as ndata['feat']
+        x = g.ndata['feat']  # (total_nodes_in_batch, in_feats)
+        return self.gnn(g, x)  # returns (batch_size, out_dim) via dgl.mean_nodes
+
+
 
 def run_all_models(
     data_root: str,
@@ -137,34 +154,66 @@ def load_modalities(data_root: str):
 
 def run_hypergraph_demo(data_root: str):
     """
-    Single forward pass of HyperCoCoFusion on your simulated_data.
-    No training, just to synthesize encoders + hypergraph + VWV + CMSI.
-    Returns a small metrics dict + shape info.
+    Single forward pass of HyperCoCoFusion using your MultimodalDGLDataset
+    (DGL graphs for FC/SC + morph + cog + labels).
+
+    Returns metrics + a small preview of predictions vs labels.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    fc, sc, morph, cog, labels = load_modalities(data_root)
-    fc = fc.to(device)
-    sc = sc.to(device)
-    morph = morph.to(device)
-    cog = cog.to(device)
-    labels = labels.to(device)
+    # 1) Build dataset & one DataLoader
+    ds = MultimodalDGLDataset(root_dir=data_root, threshold=0.0, mode='topk', k=30)
+    batch_size = min(32, len(ds))
+    dl = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=multimodal_dgl_collate_fn,
+        num_workers=0,
+    )
 
-    N = fc.shape[0]
-    d_cog = cog.shape[-1]
-    label_dim = labels.shape[-1]
+    # Take the first batch
+    g_fc, g_sc, morph, cog, labels = next(iter(dl))
+    g_fc = g_fc.to(device)
+    g_sc = g_sc.to(device)
+    morph = morph.to(device)   # (B, D, d)
+    cog = cog.to(device)       # (B, l)
+    labels = labels.to(device) # (B, c)
 
+    B = labels.size(0)
+    d_cog = cog.size(-1)
+    label_dim = labels.size(-1)
+
+    # 2) Build encoders
     cmsi_dim = 32
 
-    # Simple encoders:
-    # FC / SC: DummyEncoder over last dimension (averages over nodes)
-    encoder_fc = DummyEncoder(in_dim=fc.shape[-1], out_dim=cmsi_dim).to(device)
-    encoder_sc = DummyEncoder(in_dim=sc.shape[-1], out_dim=cmsi_dim).to(device)
-    # Morph: MLP over flattened morph features
-    encoder_morph = MLPEncoder(input_dim=morph.shape[-1],
-                               hidden_dims=[128, 64],
-                               output_dim=cmsi_dim).to(device)
+    # Node feature dimension (we stored conn_matrix as node feature in dataset.py)
+    in_feats = g_fc.ndata["feat"].shape[-1]
 
+    encoder_fc = GraphSageWrapper(
+        in_feats=in_feats,
+        hidden_dim=64,
+        out_dim=cmsi_dim,
+        num_layers=2,
+        dropout=0.1,
+    ).to(device)
+
+    encoder_sc = GraphSageWrapper(
+        in_feats=in_feats,
+        hidden_dim=64,
+        out_dim=cmsi_dim,
+        num_layers=2,
+        dropout=0.1,
+    ).to(device)
+
+    # Morph encoder: use DummyEncoder on a flattened morph vector
+    morph_flat = morph.view(B, -1)  # (B, D*d)
+    encoder_morph = DummyEncoder(
+        in_dim=morph_flat.shape[-1],
+        out_dim=cmsi_dim,
+    ).to(device)
+
+    # 3) Build HyperCoCoFusion model reusing your existing hyperfusion.py
     model = HyperCoCoFusion(
         encoder_fc=encoder_fc,
         encoder_sc=encoder_sc,
@@ -172,18 +221,19 @@ def run_hypergraph_demo(data_root: str):
         cmsi_d=cmsi_dim,
         vwv_d=d_cog,
         label_dim=label_dim,
-        cmsi_method='cross_attention',
+        cmsi_method="cross_attention",
         info_theory=False,
         vwv_riemann=False,
         use_spectral_hypergraph=True,
         use_residual=True,
     ).to(device)
 
+    # 4) Forward pass
     model.eval()
     with torch.no_grad():
-        preds = model(fc, sc, morph, cog)  # (N, C)
+        preds = model(g_fc, g_sc, morph_flat, cog)  # (B, c)
 
-    # Simple regression metrics
+    # 5) Compute simple regression metrics
     y_true = labels.cpu().numpy()
     y_pred = preds.cpu().numpy()
 
@@ -194,49 +244,34 @@ def run_hypergraph_demo(data_root: str):
     try:
         r2 = float(r2_score(y_true, y_pred))
     except ValueError:
-        # e.g., constant labels
         r2 = float("nan")
 
     metrics = {
         "mse": mse,
         "mae": mae,
         "r2": r2,
-        "N": int(N),
-        "label_dim": int(label_dim),
+        "batch_size": int(B),
         "cmsi_dim": int(cmsi_dim),
         "cog_dim": int(d_cog),
+        "label_dim": int(label_dim),
         "device": str(device),
     }
 
-    # Show first few preds vs true
+    # Preview first few rows
     preview = []
-    for i in range(min(5, N)):
-        preview.append({
-            "idx": i,
-            "y_true": y_true[i].tolist(),
-            "y_pred": y_pred[i].tolist(),
-        })
+    for i in range(min(5, B)):
+        preview.append(
+            {
+                "idx": int(i),
+                "y_true": y_true[i].tolist(),
+                "y_pred": y_pred[i].tolist(),
+            }
+        )
 
     return metrics, preview
 
+
 import torch.nn as nn
-
-class GraphSageWrapper(nn.Module):
-    def __init__(self, in_feats, hidden_dim=64, out_dim=32, num_layers=2, dropout=0.1):
-        super().__init__()
-        self.gnn = GraphSAGEEncoder(
-            in_feats=in_feats,
-            hidden_dim=hidden_dim,
-            out_dim=out_dim,
-            num_layers=num_layers,
-            dropout=dropout,
-        )
-
-    def forward(self, g):
-        # Node features were stored in dataset.build_graph as ndata['feat']
-        x = g.ndata['feat']  # (total_nodes_in_batch, in_feats)
-        return self.gnn(g, x)  # returns (batch_size, out_dim) via dgl.mean_nodes
-
 
 
 # -----------------------------------------------------------
