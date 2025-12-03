@@ -17,6 +17,7 @@ from encoders import GraphSAGEEncoder, DummyEncoder
 from hyperfusion import HyperCoCoFusion
 from dataset import MultimodalDGLDataset, multimodal_dgl_collate_fn
 
+os.environ["DGL_GRAPHBOLT_LOAD"] = "0"  # disable GraphBolt C++ extension
 
 class GraphSageWrapper(nn.Module):
     def __init__(self, in_feats, hidden_dim=64, out_dim=32, num_layers=2, dropout=0.1):
