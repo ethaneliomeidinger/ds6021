@@ -6,5 +6,5 @@ numpy
 pandas
 scikit-learn
 
-torch
-dgl
+torch==2.2.1
+dgl==2.2.1
