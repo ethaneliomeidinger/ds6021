@@ -1,0 +1,2 @@
+simulated_data/*.npy filter=lfs diff=lfs merge=lfs -text
+simulated_data/*.pkl filter=lfs diff=lfs merge=lfs -text
