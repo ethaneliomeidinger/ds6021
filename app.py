@@ -1,6 +1,9 @@
 import json
 import os
-os.environ["DGL_GRAPHBOLT_LOAD"] = "0" 
+
+# Disable DGL graphbolt loading issues
+os.environ["DGL_GRAPHBOLT_LOAD"] = "0"
+
 import numpy as np
 import pandas as pd
 
@@ -18,8 +21,12 @@ from encoders import GraphSAGEEncoder, DummyEncoder
 from hyperfusion import HyperCoCoFusion
 from datasets import MultimodalDGLDataset, multimodal_dgl_collate_fn
 
+import random
 
 
+# -----------------------------------------------------------
+# Helper wrappers / normalization (align with training script)
+# -----------------------------------------------------------
 class GraphSageWrapper(nn.Module):
     def __init__(self, in_feats, hidden_dim=64, out_dim=32, num_layers=2, dropout=0.1):
         super().__init__()
@@ -33,11 +40,13 @@ class GraphSageWrapper(nn.Module):
 
     def forward(self, g):
         # Node features were stored in dataset.build_graph as ndata['feat']
-        x = g.ndata['feat']  # (total_nodes_in_batch, in_feats)
-        return self.gnn(g, x)  # returns (batch_size, out_dim) via dgl.mean_nodes
+        x = g.ndata["feat"]  # (total_nodes_in_batch, in_feats)
+        return self.gnn(g, x)  # returns embeddings via dgl.mean_nodes
+
 
 class PullX(nn.Module):
     """Wrap a (g, x) graph encoder so it works with just (g)."""
+
     def __init__(self, base_encoder: nn.Module):
         super().__init__()
         self.base = base_encoder
@@ -56,6 +65,7 @@ class PullX(nn.Module):
 
 class FeatureAdapter(nn.Module):
     """Wrap a feature-only encoder so it accepts a single tensor argument."""
+
     def __init__(self, feat_encoder: nn.Module):
         super().__init__()
         self.feat_encoder = feat_encoder
@@ -94,9 +104,9 @@ def _build_encoder(encoder_name: str, D: int, cmsi_dim: int, morph_in: int):
     """
     Build encoders exactly like your training script:
       - graph encoder: GAT / GraphSAGE / GIN (we'll use 'gsage' in the Dash demo)
-      - morph encoder: DummyEncoder over (B, R, d)
+      - morph encoder: DummyEncoder over per-ROI morph features
     """
-    import encoders as encoders1  # to match your script’s namespace
+    import encoders as encoders1  # match your script’s namespace
 
     if encoder_name == "gin":
         enc_fc_base = encoders1.GINEncoder(in_feats=D, out_dim=cmsi_dim)
@@ -117,6 +127,10 @@ def _build_encoder(encoder_name: str, D: int, cmsi_dim: int, morph_in: int):
 
     return encoder_fc, encoder_sc, encoder_morph
 
+
+# -----------------------------------------------------------
+# Baseline sklearn models (unchanged)
+# -----------------------------------------------------------
 def run_all_models(
     data_root: str,
     val_frac: float,
@@ -157,17 +171,23 @@ def run_all_models(
 
     # 3) Lasso
     results["lasso"] = bm.run_lasso(
-        X_train, y_train,
-        X_val, y_val,
-        X_test, y_test,
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        X_test,
+        y_test,
         alpha=lasso_alpha,
     )
 
     # 4) SVR
     results["svr"] = bm.run_svr(
-        X_train, y_train,
-        X_val, y_val,
-        X_test, y_test,
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        X_test,
+        y_test,
         C=svr_C,
         epsilon=svr_epsilon,
         kernel="rbf",
@@ -175,18 +195,24 @@ def run_all_models(
 
     # 5) KNN
     results["knn"] = bm.run_knn(
-        X_train, y_train,
-        X_val, y_val,
-        X_test, y_test,
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        X_test,
+        y_test,
         n_neighbors=knn_k,
         weights="distance",
     )
 
     # 6) KMeans cluster-mean regressor
     results["kmeans"] = bm.run_kmeans_regression(
-        X_train, y_train,
-        X_val, y_val,
-        X_test, y_test,
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        X_test,
+        y_test,
         n_clusters=kmeans_k,
         random_state=seed,
     )
@@ -195,53 +221,17 @@ def run_all_models(
 
 
 # -----------------------------------------------------------
-# Helper: load raw modality npys (for HyperCoCoFusion demo)
+# Small helpers for hypergraph training
 # -----------------------------------------------------------
-def load_modalities(data_root: str):
-    """
-    Load fc, sc, morph, cog, labels from data_root/simulated_data-style folder.
-    Returns tensors on CPU.
-    """
-    def _np(path):
-        arr = np.load(path)
-        return arr
-
-    fc = _np(os.path.join(data_root, "fc.npy"))       # (N, D_fc, D_fc)
-    sc = _np(os.path.join(data_root, "sc.npy"))       # (N, D_sc, D_sc)
-    morph = _np(os.path.join(data_root, "morph.npy")) # (N, ..., ...)
-    cog = _np(os.path.join(data_root, "cog.npy"))     # (N, d_cog)
-    labels = _np(os.path.join(data_root, "labels.npy"))
-
-    # Coerce labels to (N, C)
-    if labels.ndim == 1:
-        labels = labels.reshape(-1, 1)
-
-    # Convert to float tensors
-    fc_t = torch.from_numpy(fc).float()
-    sc_t = torch.from_numpy(sc).float()
-    morph_t = torch.from_numpy(morph).float()
-    cog_t = torch.from_numpy(cog).float()
-    labels_t = torch.from_numpy(labels).float()
-
-    # Flatten morph if it's 3D so MLP sees (N, D)
-    N = morph_t.shape[0]
-    if morph_t.ndim > 2:
-        morph_flat = morph_t.view(N, -1)
-    else:
-        morph_flat = morph_t
-
-    return fc_t, sc_t, morph_flat, cog_t, labels_t
-import random
-
 def _split_indices(n, seed=42, train_ratio=0.7, val_ratio=0.15):
     idx = list(range(n))
     rng = random.Random(seed)
     rng.shuffle(idx)
     n_train = int(n * train_ratio)
-    n_val   = int(n * val_ratio)
+    n_val = int(n * val_ratio)
     train_idx = idx[:n_train]
-    val_idx   = idx[n_train:n_train+n_val]
-    test_idx  = idx[n_train+n_val:]
+    val_idx = idx[n_train : n_train + n_val]
+    test_idx = idx[n_train + n_val :]
     return train_idx, val_idx, test_idx
 
 
@@ -264,7 +254,7 @@ def _evaluate(model, dl, device):
 
 def _train_hypergraph(model, train_dl, val_dl, device, epochs=15, lr=1e-4):
     crit = torch.nn.MSELoss()
-    opt  = torch.optim.Adam(model.parameters(), lr=lr)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
 
     train_hist, val_hist = [], []
 
@@ -278,7 +268,7 @@ def _train_hypergraph(model, train_dl, val_dl, device, epochs=15, lr=1e-4):
             morph, cog, labels = morph.to(device), cog.to(device), labels.to(device)
 
             opt.zero_grad(set_to_none=True)
-            out  = model(g_fc, g_sc, morph, cog)
+            out = model(g_fc, g_sc, morph, cog)
             loss = crit(out, labels)
             if not torch.isfinite(loss):
                 continue
@@ -290,7 +280,7 @@ def _train_hypergraph(model, train_dl, val_dl, device, epochs=15, lr=1e-4):
             batches += 1
 
         train_loss = float("nan") if batches == 0 else running / batches
-        val_loss   = _evaluate(model, val_dl, device)
+        val_loss = _evaluate(model, val_dl, device)
 
         train_hist.append(train_loss)
         val_hist.append(val_loss)
@@ -298,90 +288,9 @@ def _train_hypergraph(model, train_dl, val_dl, device, epochs=15, lr=1e-4):
     return train_hist, val_hist
 
 
-def run_hypergraph_demo(data_root: str) -> str:
-    """
-    Run a single forward pass of HyperCoCoFusion on a small batch, using the
-    same wiring as your standalone training script.
-    """
-    device = torch.device("cpu")
-
-    # 1) Build a small DGL multimodal dataset
-    ds = MultimodalDGLDataset(root_dir=data_root, threshold=0.0, mode="topk", k=30)
-    dl = DataLoader(ds, batch_size=16, shuffle=False, collate_fn=multimodal_dgl_collate_fn)
-
-    try:
-        g_fc, g_sc, morph, cog, labels = next(iter(dl))
-    except StopIteration:
-        raise RuntimeError("Dataset appears to be empty; check your data_root path.")
-
-    # 2) Move to device & normalize graphs
-    g_fc = g_fc.to(device)
-    g_sc = g_sc.to(device)
-    normalize_graph_inplace(g_fc)
-    normalize_graph_inplace(g_sc)
-
-    morph = morph.to(device)   # (B, R, d)
-    cog   = cog.to(device)     # (B, l)
-    labels = labels.to(device) # (B, C)
-
-    # 3) Infer dims exactly like in your script
-    if "x" not in g_fc.ndata and "feat" in g_fc.ndata:
-        g_fc.ndata["x"] = g_fc.ndata["feat"]
-    if "x" not in g_sc.ndata and "feat" in g_sc.ndata:
-        g_sc.ndata["x"] = g_sc.ndata["feat"]
-
-    D        = g_fc.ndata["x"].shape[-1]   # node feature dim
-    morph_in = morph.shape[-1]             # d
-    vwv_d    = cog.shape[-1]               # cognitive dim
-    C        = labels.shape[-1]            # # labels
-    cmsi_dim = 32
-
-    # 4) Build encoders like _build_encoder('gsage', ...)
-    encoder_fc, encoder_sc, encoder_morph = _build_encoder(
-        encoder_name="gsage",
-        D=D,
-        cmsi_dim=cmsi_dim,
-        morph_in=morph_in,
-    )
-
-    encoder_fc.to(device)
-    encoder_sc.to(device)
-    encoder_morph.to(device)
-
-    # 5) HyperCoCoFusion model (same options as your main script)
-    model = HyperCoCoFusion(
-        encoder_fc=encoder_fc,
-        encoder_sc=encoder_sc,
-        encoder_morph=encoder_morph,
-        cmsi_d=cmsi_dim,
-        vwv_d=vwv_d,
-        label_dim=C,
-        cmsi_method="cross_attention",
-        info_theory=False,
-        vwv_riemann=True,
-        use_spectral_hypergraph=True,
-        use_residual=False,
-    ).to(device)
-
-    model.eval()
-    with torch.no_grad():
-        preds = model(g_fc, g_sc, morph, cog)
-        mse = torch.mean((preds - labels) ** 2).item()
-
-    summary = (
-        f"HyperCoCoFusion forward pass OK.\n"
-        f"preds shape: {tuple(preds.shape)}\n"
-        f"MSE on this mini-batch: {mse:.4f}"
-    )
-    return summary
-
-
-
-
 # -----------------------------------------------------------
 # Dash app
 # -----------------------------------------------------------
-
 app = Dash(__name__)
 # Expose underlying Flask server for Gunicorn / hosting platforms
 server = app.server
@@ -467,7 +376,6 @@ def benchmark_layout():
         style={"maxWidth": "1100px"},
         children=[
             html.H3("Run Baseline Models on HCP-D (Simulated)"),
-
             html.H4("Data & Split Settings"),
             html.Div(
                 style={"display": "flex", "gap": "30px", "flexWrap": "wrap"},
@@ -475,7 +383,9 @@ def benchmark_layout():
                     html.Div(
                         style={"flex": "1 1 250px"},
                         children=[
-                            html.Label("Data root (folder with cog.npy, morph.npy, sc.npy, fc.npy, labels.npy)"),
+                            html.Label(
+                                "Data root (folder with cog.npy, morph.npy, sc.npy, fc.npy, labels.npy)"
+                            ),
                             dcc.Input(
                                 id="data-root",
                                 type="text",
@@ -498,7 +408,10 @@ def benchmark_layout():
                                 max=0.3,
                                 step=0.05,
                                 value=0.15,
-                                marks={float(v): f"{int(v*100)}%" for v in np.arange(0.05, 0.35, 0.05)},
+                                marks={
+                                    float(v): f"{int(v * 100)}%"
+                                    for v in np.arange(0.05, 0.35, 0.05)
+                                },
                             ),
                         ],
                     ),
@@ -512,7 +425,10 @@ def benchmark_layout():
                                 max=0.3,
                                 step=0.05,
                                 value=0.15,
-                                marks={float(v): f"{int(v*100)}%" for v in np.arange(0.05, 0.35, 0.05)},
+                                marks={
+                                    float(v): f"{int(v * 100)}%"
+                                    for v in np.arange(0.05, 0.35, 0.05)
+                                },
                             ),
                         ],
                     ),
@@ -530,9 +446,7 @@ def benchmark_layout():
                     ),
                 ],
             ),
-
             html.Hr(),
-
             html.H4("Model Hyperparameters"),
             html.Div(
                 style={"display": "flex", "gap": "30px", "flexWrap": "wrap"},
@@ -604,14 +518,15 @@ def benchmark_layout():
                     ),
                 ],
             ),
-
             html.Br(),
             html.Button("Run Baselines", id="run-btn", n_clicks=0),
-
-            html.Div(id="dataset-info", style={"marginTop": "10px", "fontStyle": "italic"}),
-
-            html.Hr(),
-
+            html.Div(
+                id="dataset-info",
+                style={"marginTop": "10px", "fontStyle": "italic"},
+            ),
+            html.Br(),
+            html.H4("Model Metrics"),
+            html.Div(id="metrics-table"),
             html.Hr(),
             html.H4("KMeans Unsupervised Diagnostics"),
             html.Pre(id="kmeans-info", style={"whiteSpace": "pre-wrap"}),
@@ -631,26 +546,30 @@ def hypergraph_layout():
                 "This tab trains HyperCoCoFusion for a small number of epochs "
                 "on the simulated multimodal dataset (fc/sc/morph/cog/labels)."
             ),
-
-            html.Label("Data root (folder with fc.npy/sc.npy/morph.npy/cog.npy/labels.npy)"),
+            html.Label(
+                "Data root (folder with fc.npy/sc.npy/morph.npy/cog.npy/labels.npy)"
+            ),
             dcc.Input(
                 id="hyper-data-root",
                 type="text",
                 value="simulated_data",
                 style={"width": "100%"},
             ),
-            html.Br(), html.Br(),
-
+            html.Br(),
+            html.Br(),
             html.Label("Training epochs"),
             dcc.Slider(
                 id="hyper-epochs",
-                min=1, max=30, step=1, value=15,
+                min=1,
+                max=30,
+                step=1,
+                value=15,
                 marks={1: "1", 5: "5", 15: "15", 30: "30"},
             ),
             html.Br(),
-
-            html.Button("Train Hypergraph Model", id="hyper-train-btn", n_clicks=0),
-
+            html.Button(
+                "Train Hypergraph Model", id="hyper-train-btn", n_clicks=0
+            ),
             html.Div(
                 id="hyper-status",
                 style={
@@ -660,7 +579,6 @@ def hypergraph_layout():
                     "color": "#333",
                 },
             ),
-
             html.Hr(),
             html.H4("Training vs Validation Loss (MSE)"),
             dcc.Graph(id="hyper-loss-fig"),
@@ -668,13 +586,11 @@ def hypergraph_layout():
     )
 
 
-
 # -----------------------------------------------------------
 # Callback: run baselines
 # -----------------------------------------------------------
 @app.callback(
     Output("metrics-table", "children"),
-    Output("r2-figure", "figure"),
     Output("kmeans-info", "children"),
     Output("dataset-info", "children"),
     Input("run-btn", "n_clicks"),
@@ -715,8 +631,7 @@ def on_run_click(
         )
     except Exception as e:
         error_msg = f"Error running models: {e}"
-        empty_fig = go.Figure()
-        return html.Div(error_msg, style={"color": "red"}), empty_fig, "", ""
+        return html.Div(error_msg, style={"color": "red"}), "", ""
 
     # -------------------------------
     # Build metrics DataFrame
@@ -746,24 +661,6 @@ def on_run_click(
     )
 
     # -------------------------------
-    # R² bar figure
-    # -------------------------------
-    model_names = sorted(results.keys())
-    splits = ["train", "val", "test"]
-
-    fig = go.Figure()
-    for split in splits:
-        r2_values = [results[m][split]["r2"] for m in model_names]
-        fig.add_bar(name=split, x=model_names, y=r2_values)
-
-    fig.update_layout(
-        barmode="group",
-        xaxis_title="Model",
-        yaxis_title="R²",
-        legend_title="Split",
-    )
-
-    # -------------------------------
     # KMeans diagnostics
     # -------------------------------
     km_res = results.get("kmeans", {})
@@ -786,14 +683,17 @@ def on_run_click(
         n_targets = y_shape[1]
     else:
         n_targets = 1
-    dataset_info = f"Loaded X shape: {X_shape}, y shape: {y_shape} (N={N}, D={D}, targets={n_targets})"
+    dataset_info = (
+        f"Loaded X shape: {X_shape}, y shape: {y_shape} "
+        f"(N={N}, D={D}, targets={n_targets})"
+    )
 
-    return metrics_table, fig, kmeans_text, dataset_info
+    return metrics_table, kmeans_text, dataset_info
 
 
 # -----------------------------------------------------------
-# Callback: run Hypergraph Fusion demo
-# ----------------------------------------------------------
+# Callback: train Hypergraph Fusion demo
+# -----------------------------------------------------------
 @app.callback(
     Output("hyper-status", "children"),
     Output("hyper-loss-fig", "figure"),
@@ -807,20 +707,36 @@ def train_hypergraph_callback(n_clicks, data_root, epochs):
         device = torch.device("cpu")
 
         # 1) Dataset + splits
-        full_ds = MultimodalDGLDataset(root_dir=data_root, threshold=0.0, mode="topk", k=30)
+        full_ds = MultimodalDGLDataset(
+            root_dir=data_root, threshold=0.0, mode="topk", k=30
+        )
         N = len(full_ds)
-        train_idx, val_idx, test_idx = _split_indices(N, seed=301, train_ratio=0.7, val_ratio=0.15)
+        train_idx, val_idx, test_idx = _split_indices(
+            N, seed=301, train_ratio=0.7, val_ratio=0.15
+        )
 
         train_ds = torch.utils.data.Subset(full_ds, train_idx)
-        val_ds   = torch.utils.data.Subset(full_ds, val_idx)
-        test_ds  = torch.utils.data.Subset(full_ds, test_idx)
+        val_ds = torch.utils.data.Subset(full_ds, val_idx)
+        test_ds = torch.utils.data.Subset(full_ds, test_idx)
 
-        train_dl = DataLoader(train_ds, batch_size=32, shuffle=True,
-                              collate_fn=multimodal_dgl_collate_fn)
-        val_dl   = DataLoader(val_ds,   batch_size=32, shuffle=False,
-                              collate_fn=multimodal_dgl_collate_fn)
-        test_dl  = DataLoader(test_ds,  batch_size=32, shuffle=False,
-                              collate_fn=multimodal_dgl_collate_fn)
+        train_dl = DataLoader(
+            train_ds,
+            batch_size=32,
+            shuffle=True,
+            collate_fn=multimodal_dgl_collate_fn,
+        )
+        val_dl = DataLoader(
+            val_ds,
+            batch_size=32,
+            shuffle=False,
+            collate_fn=multimodal_dgl_collate_fn,
+        )
+        test_dl = DataLoader(
+            test_ds,
+            batch_size=32,
+            shuffle=False,
+            collate_fn=multimodal_dgl_collate_fn,
+        )
 
         # 2) Peek at one batch to infer dims
         g_fc_b, g_sc_b, morph_b, cog_b, labels_b = next(iter(train_dl))
@@ -829,18 +745,15 @@ def train_hypergraph_callback(n_clicks, data_root, epochs):
         if "x" not in g_sc_b.ndata and "feat" in g_sc_b.ndata:
             g_sc_b.ndata["x"] = g_sc_b.ndata["feat"]
 
-        D        = g_fc_b.ndata["x"].shape[-1]   # node feature dim
-        morph_in = morph_b.shape[-1]             # per-ROI morph dim
-        vwv_d    = cog_b.shape[-1]               # cognitive dim
-        C        = labels_b.shape[-1]            # labels
+        D = g_fc_b.ndata["x"].shape[-1]  # node feature dim
+        morph_in = morph_b.shape[-1]  # per-ROI morph dim
+        vwv_d = cog_b.shape[-1]  # cognitive dim
+        C = labels_b.shape[-1]  # labels
         cmsi_dim = 32
 
         # 3) Build encoders and model (GraphSAGE version)
         encoder_fc, encoder_sc, encoder_morph = _build_encoder(
-            encoder_name="gsage",
-            D=D,
-            cmsi_dim=cmsi_dim,
-            morph_in=morph_in,
+            encoder_name="gsage", D=D, cmsi_dim=cmsi_dim, morph_in=morph_in
         )
         encoder_fc.to(device)
         encoder_sc.to(device)
@@ -878,13 +791,13 @@ def train_hypergraph_callback(n_clicks, data_root, epochs):
         # 6) Build loss curve figure
         fig = go.Figure()
         fig.add_scatter(
-            x=list(range(1, len(train_hist)+1)),
+            x=list(range(1, len(train_hist) + 1)),
             y=train_hist,
             mode="lines+markers",
             name="train",
         )
         fig.add_scatter(
-            x=list(range(1, len(val_hist)+1)),
+            x=list(range(1, len(val_hist) + 1)),
             y=val_hist,
             mode="lines+markers",
             name="val",
@@ -900,7 +813,6 @@ def train_hypergraph_callback(n_clicks, data_root, epochs):
     except Exception as e:
         err_fig = go.Figure()
         return f"Error while training HyperCoCoFusion: {e}", err_fig
-
 
 
 # -----------------------------------------------------------
