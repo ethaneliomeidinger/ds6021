@@ -9,4 +9,4 @@ scikit-learn
 torch==2.2.0
 dgl==2.2.0
 torchdata
-
+pyyaml
