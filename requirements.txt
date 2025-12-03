@@ -2,9 +2,11 @@ dash==3.3.0
 plotly==6.5.0
 gunicorn
 
-numpy
+numpy<2
 pandas
 scikit-learn
 
 torch==2.2.0
 dgl==2.2.0
+torchdata
+
