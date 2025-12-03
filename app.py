@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 
 from encoders import GraphSAGEEncoder, DummyEncoder
 from hyperfusion import HyperCoCoFusion
-from dataset import MultimodalDGLDataset, multimodal_dgl_collate_fn
+from datasets import MultimodalDGLDataset, multimodal_dgl_collate_fn
 
 
 
