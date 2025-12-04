@@ -6,8 +6,7 @@ numpy<2
 pandas
 scikit-learn
 
-torch==2.2.0
-dgl==2.2.0
-torchdata
+torch==2.0.1
+dgl==1.1.3
 
 
