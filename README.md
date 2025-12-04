@@ -4,3 +4,12 @@ It is important to note that because I am under NDA, the data here is simulation
 
 https://ds6021.onrender.com here is the web app. Unfortunately, the data is too large to actually run on a web server without paying money, but the app file
 works on any machine with greater than 500 gb of memory
+
+
+Slides: ML1Proj.pdf
+
+Data: Simulated_data folder
+
+Compiled code: all other files
+
+Web app: https://ds6021.onrender.com
