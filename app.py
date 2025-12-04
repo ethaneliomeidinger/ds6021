@@ -105,11 +105,6 @@ def normalize_graph_inplace(g, feat_key_src="feat", feat_key_dst="x"):
 
 
 def _build_encoder(encoder_name: str, D: int, cmsi_dim: int, morph_in: int):
-    """
-    Build encoders similar to your training script:
-      - graph encoder: GAT / GraphSAGE / GIN (you’ll use 'gsage' in this app)
-      - morph encoder: DummyEncoder over (B, R, d)
-    """
     import encoders as encoders1  # to match your script’s namespace
 
     if encoder_name == "gin":
@@ -148,15 +143,6 @@ def run_all_models(
     kmeans_k: int,
 ):
     """
-    Orchestrate all sklearn baselines on concatenated features.
-
-      - load_concatenated_features
-      - make_splits
-      - run_lasso
-      - run_svr
-      - run_knn
-      - run_kmeans_regression
-
     Returns:
       results: dict[model_name -> result_dict]
       X_shape: tuple
@@ -458,7 +444,7 @@ def data_description_layout():
             ),
             html.P(
                 "Together, these tasks probe executive control, working memory, processing speed, "
-                "language, and episodic memory, providing a behavioral context for the brain measures."
+                "language, and episodic memory, providing a cognitive context for the brain measures."
             ),
         ],
     )
@@ -491,7 +477,7 @@ def benchmark_layout():
                                 style={"width": "100%"},
                             ),
                             html.Small(
-                                "Update this path if your .npy files live somewhere else.",
+                                "File Path",
                                 style={"display": "block", "marginTop": "4px"},
                             ),
                         ],
@@ -630,10 +616,6 @@ def benchmark_layout():
             html.Hr(),
             html.H4("Model Performance (MSE, MAE, R²)"),
             html.Div(id="metrics-table"),
-
-            html.Hr(),
-            html.H4("KMeans Unsupervised Diagnostics"),
-            html.Pre(id="kmeans-info", style={"whiteSpace": "pre-wrap"}),
         ],
     )
 
@@ -774,22 +756,6 @@ def on_run_click(
         style_table={"overflowX": "auto"},
         style_cell={"fontSize": 11, "padding": "4px"},
     )
-
-    # -------------------------------
-    # KMeans diagnostics
-    # -------------------------------
-    km_res = results.get("kmeans", {})
-    unsup = km_res.get("unsupervised_metrics", {})
-    inertia = unsup.get("inertia", None)
-    silhouette = unsup.get("silhouette_train", None)
-    if inertia is None:
-        kmeans_text = "KMeans diagnostics not available."
-    else:
-        kmeans_text = (
-            f"Inertia: {inertia:.4f}\nSilhouette (train): "
-            f"{'nan' if silhouette is None else f'{silhouette:.4f}'}"
-        )
-
     # -------------------------------
     # Dataset info
     # -------------------------------
