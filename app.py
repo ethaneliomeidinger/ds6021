@@ -684,7 +684,6 @@ def hypergraph_layout():
 
 @app.callback(
     Output("metrics-table", "children"),
-    Output("kmeans-info", "children"),
     Output("dataset-info", "children"),
     Input("run-btn", "n_clicks"),
     State("data-root", "value"),
@@ -769,7 +768,7 @@ def on_run_click(
         f"(N={N}, D={D}, targets={n_targets})"
     )
 
-    return metrics_table, kmeans_text, dataset_info
+    return metrics_table, dataset_info
 
 
 # -----------------------------------------------------------
