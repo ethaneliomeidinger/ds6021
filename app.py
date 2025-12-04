@@ -723,11 +723,8 @@ def on_run_click(
         )
     except Exception as e:
         error_msg = f"Error running models: {e}"
-        return (
-            html.Div(error_msg, style={"color": "red"}),
-            "",
-            "",
-        )
+        return html.Div(error_msg, style={"color": "red"}), ""
+
 
     # -------------------------------
     # Build metrics DataFrame
