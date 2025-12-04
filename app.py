@@ -1,3 +1,5 @@
+#http://127.0.0.1:8050
+
 import json
 import os
 
@@ -103,11 +105,6 @@ def normalize_graph_inplace(g, feat_key_src="feat", feat_key_dst="x"):
 
 
 def _build_encoder(encoder_name: str, D: int, cmsi_dim: int, morph_in: int):
-    """
-    Build encoders similar to your training script:
-      - graph encoder: GAT / GraphSAGE / GIN (you’ll use 'gsage' in this app)
-      - morph encoder: DummyEncoder over (B, R, d)
-    """
     import encoders as encoders1  # to match your script’s namespace
 
     if encoder_name == "gin":
@@ -146,15 +143,6 @@ def run_all_models(
     kmeans_k: int,
 ):
     """
-    Orchestrate all sklearn baselines on concatenated features.
-
-      - load_concatenated_features
-      - make_splits
-      - run_lasso
-      - run_svr
-      - run_knn
-      - run_kmeans_regression
-
     Returns:
       results: dict[model_name -> result_dict]
       X_shape: tuple
@@ -489,7 +477,7 @@ def benchmark_layout():
                                 style={"width": "100%"},
                             ),
                             html.Small(
-                                "Update this path if your .npy files live somewhere else.",
+                                "File Path",
                                 style={"display": "block", "marginTop": "4px"},
                             ),
                         ],
@@ -628,10 +616,6 @@ def benchmark_layout():
             html.Hr(),
             html.H4("Model Performance (MSE, MAE, R²)"),
             html.Div(id="metrics-table"),
-
-            html.Hr(),
-            html.H4("KMeans Unsupervised Diagnostics"),
-            html.Pre(id="kmeans-info", style={"whiteSpace": "pre-wrap"}),
         ],
     )
 
@@ -700,7 +684,6 @@ def hypergraph_layout():
 
 @app.callback(
     Output("metrics-table", "children"),
-    Output("kmeans-info", "children"),
     Output("dataset-info", "children"),
     Input("run-btn", "n_clicks"),
     State("data-root", "value"),
@@ -740,11 +723,8 @@ def on_run_click(
         )
     except Exception as e:
         error_msg = f"Error running models: {e}"
-        return (
-            html.Div(error_msg, style={"color": "red"}),
-            "",
-            "",
-        )
+        return html.Div(error_msg, style={"color": "red"}), ""
+
 
     # -------------------------------
     # Build metrics DataFrame
@@ -772,22 +752,6 @@ def on_run_click(
         style_table={"overflowX": "auto"},
         style_cell={"fontSize": 11, "padding": "4px"},
     )
-
-    # -------------------------------
-    # KMeans diagnostics
-    # -------------------------------
-    km_res = results.get("kmeans", {})
-    unsup = km_res.get("unsupervised_metrics", {})
-    inertia = unsup.get("inertia", None)
-    silhouette = unsup.get("silhouette_train", None)
-    if inertia is None:
-        kmeans_text = "KMeans diagnostics not available."
-    else:
-        kmeans_text = (
-            f"Inertia: {inertia:.4f}\nSilhouette (train): "
-            f"{'nan' if silhouette is None else f'{silhouette:.4f}'}"
-        )
-
     # -------------------------------
     # Dataset info
     # -------------------------------
@@ -801,7 +765,7 @@ def on_run_click(
         f"(N={N}, D={D}, targets={n_targets})"
     )
 
-    return metrics_table, kmeans_text, dataset_info
+    return metrics_table, dataset_info
 
 
 # -----------------------------------------------------------
@@ -938,3 +902,4 @@ def train_hypergraph_callback(n_clicks, data_root, epochs):
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=8050)
+
