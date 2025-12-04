@@ -1,7 +1,7 @@
 import json
 import os
 
-# Disable DGL graphbolt loading issues
+# Make DGL skip GraphBolt to avoid extra deps issues
 os.environ["DGL_GRAPHBOLT_LOAD"] = "0"
 
 import numpy as np
@@ -12,7 +12,7 @@ import plotly.graph_objects as go
 
 import benchmark as bm
 
-# NEW: PyTorch + DGL-based stuff
+# PyTorch + DGL-related imports
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -25,9 +25,14 @@ import random
 
 
 # -----------------------------------------------------------
-# Helper wrappers / normalization (align with training script)
+# Wrapper utilities for encoders + normalization
 # -----------------------------------------------------------
+
 class GraphSageWrapper(nn.Module):
+    """
+    Simple wrapper around your GraphSAGEEncoder that expects (g) only.
+    Not strictly needed in the current wiring, but kept for flexibility.
+    """
     def __init__(self, in_feats, hidden_dim=64, out_dim=32, num_layers=2, dropout=0.1):
         super().__init__()
         self.gnn = GraphSAGEEncoder(
@@ -39,14 +44,12 @@ class GraphSageWrapper(nn.Module):
         )
 
     def forward(self, g):
-        # Node features were stored in dataset.build_graph as ndata['feat']
-        x = g.ndata["feat"]  # (total_nodes_in_batch, in_feats)
-        return self.gnn(g, x)  # returns embeddings via dgl.mean_nodes
+        x = g.ndata["feat"]
+        return self.gnn(g, x)
 
 
 class PullX(nn.Module):
     """Wrap a (g, x) graph encoder so it works with just (g)."""
-
     def __init__(self, base_encoder: nn.Module):
         super().__init__()
         self.base = base_encoder
@@ -65,7 +68,6 @@ class PullX(nn.Module):
 
 class FeatureAdapter(nn.Module):
     """Wrap a feature-only encoder so it accepts a single tensor argument."""
-
     def __init__(self, feat_encoder: nn.Module):
         super().__init__()
         self.feat_encoder = feat_encoder
@@ -102,11 +104,11 @@ def normalize_graph_inplace(g, feat_key_src="feat", feat_key_dst="x"):
 
 def _build_encoder(encoder_name: str, D: int, cmsi_dim: int, morph_in: int):
     """
-    Build encoders exactly like your training script:
-      - graph encoder: GAT / GraphSAGE / GIN (we'll use 'gsage' in the Dash demo)
-      - morph encoder: DummyEncoder over per-ROI morph features
+    Build encoders similar to your training script:
+      - graph encoder: GAT / GraphSAGE / GIN (you’ll use 'gsage' in this app)
+      - morph encoder: DummyEncoder over (B, R, d)
     """
-    import encoders as encoders1  # match your script’s namespace
+    import encoders as encoders1  # to match your script’s namespace
 
     if encoder_name == "gin":
         enc_fc_base = encoders1.GINEncoder(in_feats=D, out_dim=cmsi_dim)
@@ -129,8 +131,9 @@ def _build_encoder(encoder_name: str, D: int, cmsi_dim: int, morph_in: int):
 
 
 # -----------------------------------------------------------
-# Baseline sklearn models (unchanged)
+# Baseline models: Lasso, SVR, KNN, KMeans
 # -----------------------------------------------------------
+
 def run_all_models(
     data_root: str,
     val_frac: float,
@@ -159,7 +162,7 @@ def run_all_models(
     """
     np.random.seed(seed)
 
-    # 1) Load HCP-D (simulated) features
+    # 1) Load multi-modal concatenated features
     X, y = bm.load_concatenated_features(data_root)
 
     # 2) Split into train/val/test
@@ -171,23 +174,17 @@ def run_all_models(
 
     # 3) Lasso
     results["lasso"] = bm.run_lasso(
-        X_train,
-        y_train,
-        X_val,
-        y_val,
-        X_test,
-        y_test,
+        X_train, y_train,
+        X_val, y_val,
+        X_test, y_test,
         alpha=lasso_alpha,
     )
 
     # 4) SVR
     results["svr"] = bm.run_svr(
-        X_train,
-        y_train,
-        X_val,
-        y_val,
-        X_test,
-        y_test,
+        X_train, y_train,
+        X_val, y_val,
+        X_test, y_test,
         C=svr_C,
         epsilon=svr_epsilon,
         kernel="rbf",
@@ -195,24 +192,18 @@ def run_all_models(
 
     # 5) KNN
     results["knn"] = bm.run_knn(
-        X_train,
-        y_train,
-        X_val,
-        y_val,
-        X_test,
-        y_test,
+        X_train, y_train,
+        X_val, y_val,
+        X_test, y_test,
         n_neighbors=knn_k,
         weights="distance",
     )
 
     # 6) KMeans cluster-mean regressor
     results["kmeans"] = bm.run_kmeans_regression(
-        X_train,
-        y_train,
-        X_val,
-        y_val,
-        X_test,
-        y_test,
+        X_train, y_train,
+        X_val, y_val,
+        X_test, y_test,
         n_clusters=kmeans_k,
         random_state=seed,
     )
@@ -221,8 +212,9 @@ def run_all_models(
 
 
 # -----------------------------------------------------------
-# Small helpers for hypergraph training
+# Hypergraph (HyperCoCoFusion) training helpers
 # -----------------------------------------------------------
+
 def _split_indices(n, seed=42, train_ratio=0.7, val_ratio=0.15):
     idx = list(range(n))
     rng = random.Random(seed)
@@ -230,8 +222,8 @@ def _split_indices(n, seed=42, train_ratio=0.7, val_ratio=0.15):
     n_train = int(n * train_ratio)
     n_val = int(n * val_ratio)
     train_idx = idx[:n_train]
-    val_idx = idx[n_train : n_train + n_val]
-    test_idx = idx[n_train + n_val :]
+    val_idx = idx[n_train:n_train + n_val]
+    test_idx = idx[n_train + n_val:]
     return train_idx, val_idx, test_idx
 
 
@@ -289,11 +281,11 @@ def _train_hypergraph(model, train_dl, val_dl, device, epochs=15, lr=1e-4):
 
 
 # -----------------------------------------------------------
-# Dash app
+# Dash app setup
 # -----------------------------------------------------------
+
 app = Dash(__name__)
-# Expose underlying Flask server for Gunicorn / hosting platforms
-server = app.server
+server = app.server  # for Gunicorn / Render
 app.title = "HCP-D Brain Imaging Benchmarks"
 
 
@@ -306,6 +298,7 @@ app.layout = html.Div(
             value="tab-readme",
             children=[
                 dcc.Tab(label="README", value="tab-readme"),
+                dcc.Tab(label="Data Description", value="tab-data-description"),
                 dcc.Tab(label="Baseline Benchmarks", value="tab-benchmarks"),
                 dcc.Tab(label="Hypergraph Fusion Demo", value="tab-hypergraph"),
             ],
@@ -322,6 +315,8 @@ app.layout = html.Div(
 def render_tab(tab):
     if tab == "tab-readme":
         return readme_layout()
+    elif tab == "tab-data-description":
+        return data_description_layout()
     elif tab == "tab-benchmarks":
         return benchmark_layout()
     elif tab == "tab-hypergraph":
@@ -332,6 +327,7 @@ def render_tab(tab):
 # -----------------------------------------------------------
 # README tab
 # -----------------------------------------------------------
+
 def readme_layout():
     return html.Div(
         style={"maxWidth": "900px"},
@@ -360,7 +356,7 @@ def readme_layout():
                     html.Li("Lasso (multi-output regression via MultiOutputRegressor)"),
                     html.Li("Support Vector Regression (SVR; RBF kernel)"),
                     html.Li("K-Nearest Neighbors regression"),
-                    html.Li("K-Means cluster-mean regression (unsupervised features + cluster-wise label means)"),
+                    html.Li("K-Means cluster-mean regression"),
                     html.Li("HyperCoCoFusion (spectral hypergraph + CMSI, demo tab)"),
                 ]
             ),
@@ -369,13 +365,113 @@ def readme_layout():
 
 
 # -----------------------------------------------------------
+# Data Description tab
+# -----------------------------------------------------------
+
+def data_description_layout():
+    return html.Div(
+        style={"maxWidth": "900px", "lineHeight": "1.6"},
+        children=[
+            html.H2("Data Description"),
+
+            html.H3("Neuroimaging Modalities"),
+            html.Img(
+                src="/assets/fmri.png",
+                style={
+                    "width": "100%",
+                    "border": "1px solid #ccc",
+                    "borderRadius": "6px",
+                    "marginBottom": "20px",
+                },
+            ),
+
+            html.H4("Functional Connectivity (FC)"),
+            html.P(
+                "Functional connectivity is derived from correlations in resting-state fMRI "
+                "time series across cortical regions. FC captures distributed patterns of "
+                "co-activation and reflects large-scale functional organization, including "
+                "default mode, attention, and sensorimotor systems."
+            ),
+
+            html.H4("Structural Connectivity (SC)"),
+            html.P(
+                "Structural connectivity is computed from diffusion MRI using tractography, "
+                "estimating the white-matter pathways linking cortical regions. SC reflects "
+                "anatomical communication routes supporting information flow across the brain."
+            ),
+
+            html.H4("Morphology (Cortical Morphometry)"),
+            html.P(
+                "Morphological features include cortical thickness, surface area, curvature, "
+                "and other geometry-derived measurements across regions of the cortex. These "
+                "features index structural maturation, cortical expansion, and neurodevelopmental "
+                "variation relevant to cognitive and behavioral outcomes."
+            ),
+
+            html.Hr(),
+
+            html.H3("Behavioral Labels (CBCL Scores)"),
+            html.P(
+                "The Child Behavior Checklist (CBCL/6–18; Achenbach & Rescorla, 2001) provides "
+                "standardized parent-reported assessments of emotional and behavioral functioning "
+                "in youth (Chavannes & Gignac, 2024). We use three composite age- and sex-"
+                "normalized T-scores:"
+            ),
+
+            html.H4("Total Problems"),
+            html.P(
+                "A global index of behavioral and emotional dysregulation. It aggregates all "
+                "syndrome scales, including attention problems, anxiety, depressive symptoms, "
+                "social difficulties, rule-breaking behavior, and aggression."
+            ),
+
+            html.H4("Internalizing Problems"),
+            html.P(
+                "Reflects inwardly directed distress, combining Anxious/Depressed, "
+                "Withdrawn/Depressed, and Somatic Complaints subscales. Elevated scores "
+                "indicate anxiety, social withdrawal, depressive affect, and somatic concerns."
+            ),
+
+            html.H4("Externalizing Problems"),
+            html.P(
+                "Measures outwardly directed dysregulation, including Rule-Breaking Behavior "
+                "and Aggressive Behavior subscales. High scores indicate impulsivity, "
+                "behavioral disinhibition, and difficulty regulating conflict or anger."
+            ),
+
+            html.Hr(),
+
+            html.H3("Cognitive Assessments"),
+            html.P("The following NIH Toolbox tasks are included:"),
+            html.Ul(
+                [
+                    html.Li("Dimensional Card Change Sort"),
+                    html.Li("Flanker Inhibitory Control and Attention"),
+                    html.Li("List Sort Working Memory"),
+                    html.Li("Oral Reading Recognition"),
+                    html.Li("Pattern Comparison Processing Speed"),
+                    html.Li("Picture Sequence Memory"),
+                    html.Li("Picture Vocabulary"),
+                ]
+            ),
+            html.P(
+                "Together, these tasks probe executive control, working memory, processing speed, "
+                "language, and episodic memory, providing a behavioral context for the brain measures."
+            ),
+        ],
+    )
+
+
+# -----------------------------------------------------------
 # Benchmark tab layout
 # -----------------------------------------------------------
+
 def benchmark_layout():
     return html.Div(
         style={"maxWidth": "1100px"},
         children=[
             html.H3("Run Baseline Models on HCP-D (Simulated)"),
+
             html.H4("Data & Split Settings"),
             html.Div(
                 style={"display": "flex", "gap": "30px", "flexWrap": "wrap"},
@@ -389,11 +485,11 @@ def benchmark_layout():
                             dcc.Input(
                                 id="data-root",
                                 type="text",
-                                value="simulated_data",  # default: repo folder
+                                value="simulated_data",
                                 style={"width": "100%"},
                             ),
                             html.Small(
-                                "Update this path if your .npy files live somewhere else (relative to app root).",
+                                "Update this path if your .npy files live somewhere else.",
                                 style={"display": "block", "marginTop": "4px"},
                             ),
                         ],
@@ -446,7 +542,9 @@ def benchmark_layout():
                     ),
                 ],
             ),
+
             html.Hr(),
+
             html.H4("Model Hyperparameters"),
             html.Div(
                 style={"display": "flex", "gap": "30px", "flexWrap": "wrap"},
@@ -518,15 +616,19 @@ def benchmark_layout():
                     ),
                 ],
             ),
+
             html.Br(),
             html.Button("Run Baselines", id="run-btn", n_clicks=0),
+
             html.Div(
                 id="dataset-info",
                 style={"marginTop": "10px", "fontStyle": "italic"},
             ),
-            html.Br(),
-            html.H4("Model Metrics"),
+
+            html.Hr(),
+            html.H4("Model Performance (MSE, MAE, R²)"),
             html.Div(id="metrics-table"),
+
             html.Hr(),
             html.H4("KMeans Unsupervised Diagnostics"),
             html.Pre(id="kmeans-info", style={"whiteSpace": "pre-wrap"}),
@@ -537,6 +639,7 @@ def benchmark_layout():
 # -----------------------------------------------------------
 # Hypergraph Fusion tab layout
 # -----------------------------------------------------------
+
 def hypergraph_layout():
     return html.Div(
         style={"maxWidth": "900px"},
@@ -544,8 +647,10 @@ def hypergraph_layout():
             html.H3("Hypergraph Fusion Demo (HyperCoCoFusion)"),
             html.P(
                 "This tab trains HyperCoCoFusion for a small number of epochs "
-                "on the simulated multimodal dataset (fc/sc/morph/cog/labels)."
+                "on the simulated multimodal dataset (fc/sc/morph/cog/labels). "
+                "We use GraphSAGE encoders for FC and SC, and a DummyEncoder for morphology."
             ),
+
             html.Label(
                 "Data root (folder with fc.npy/sc.npy/morph.npy/cog.npy/labels.npy)"
             ),
@@ -555,8 +660,8 @@ def hypergraph_layout():
                 value="simulated_data",
                 style={"width": "100%"},
             ),
-            html.Br(),
-            html.Br(),
+            html.Br(), html.Br(),
+
             html.Label("Training epochs"),
             dcc.Slider(
                 id="hyper-epochs",
@@ -567,9 +672,11 @@ def hypergraph_layout():
                 marks={1: "1", 5: "5", 15: "15", 30: "30"},
             ),
             html.Br(),
+
             html.Button(
                 "Train Hypergraph Model", id="hyper-train-btn", n_clicks=0
             ),
+
             html.Div(
                 id="hyper-status",
                 style={
@@ -579,6 +686,7 @@ def hypergraph_layout():
                     "color": "#333",
                 },
             ),
+
             html.Hr(),
             html.H4("Training vs Validation Loss (MSE)"),
             dcc.Graph(id="hyper-loss-fig"),
@@ -589,6 +697,7 @@ def hypergraph_layout():
 # -----------------------------------------------------------
 # Callback: run baselines
 # -----------------------------------------------------------
+
 @app.callback(
     Output("metrics-table", "children"),
     Output("kmeans-info", "children"),
@@ -631,7 +740,11 @@ def on_run_click(
         )
     except Exception as e:
         error_msg = f"Error running models: {e}"
-        return html.Div(error_msg, style={"color": "red"}), "", ""
+        return (
+            html.Div(error_msg, style={"color": "red"}),
+            "",
+            "",
+        )
 
     # -------------------------------
     # Build metrics DataFrame
@@ -692,8 +805,9 @@ def on_run_click(
 
 
 # -----------------------------------------------------------
-# Callback: train Hypergraph Fusion demo
+# Callback: train Hypergraph Fusion model
 # -----------------------------------------------------------
+
 @app.callback(
     Output("hyper-status", "children"),
     Output("hyper-loss-fig", "figure"),
@@ -746,14 +860,17 @@ def train_hypergraph_callback(n_clicks, data_root, epochs):
             g_sc_b.ndata["x"] = g_sc_b.ndata["feat"]
 
         D = g_fc_b.ndata["x"].shape[-1]  # node feature dim
-        morph_in = morph_b.shape[-1]  # per-ROI morph dim
-        vwv_d = cog_b.shape[-1]  # cognitive dim
-        C = labels_b.shape[-1]  # labels
+        morph_in = morph_b.shape[-1]     # per-ROI morph dim (last dim)
+        vwv_d = cog_b.shape[-1]          # cognitive dim
+        C = labels_b.shape[-1]           # labels
         cmsi_dim = 32
 
         # 3) Build encoders and model (GraphSAGE version)
         encoder_fc, encoder_sc, encoder_morph = _build_encoder(
-            encoder_name="gsage", D=D, cmsi_dim=cmsi_dim, morph_in=morph_in
+            encoder_name="gsage",
+            D=D,
+            cmsi_dim=cmsi_dim,
+            morph_in=morph_in,
         )
         encoder_fc.to(device)
         encoder_sc.to(device)
@@ -773,7 +890,7 @@ def train_hypergraph_callback(n_clicks, data_root, epochs):
             use_residual=False,
         ).to(device)
 
-        # 4) Train for the requested number of epochs
+        # 4) Train
         train_hist, val_hist = _train_hypergraph(
             model, train_dl, val_dl, device, epochs=int(epochs), lr=1e-4
         )
@@ -784,11 +901,11 @@ def train_hypergraph_callback(n_clicks, data_root, epochs):
         status = (
             f"Trained HyperCoCoFusion for {epochs} epochs on {data_root}.\n"
             f"Train loss (last epoch): {train_hist[-1]:.4f}\n"
-            f"Val loss   (last epoch): {val_hist[-1]:.4f}\n"
+            f"Val   loss (last epoch): {val_hist[-1]:.4f}\n"
             f"Test loss              : {test_loss:.4f}"
         )
 
-        # 6) Build loss curve figure
+        # 6) Build loss curve
         fig = go.Figure()
         fig.add_scatter(
             x=list(range(1, len(train_hist) + 1)),
@@ -818,6 +935,7 @@ def train_hypergraph_callback(n_clicks, data_root, epochs):
 # -----------------------------------------------------------
 # Main
 # -----------------------------------------------------------
+
 if __name__ == "__main__":
-    # For local dev; hosting platforms usually call `server` via Gunicorn.
     app.run(debug=True, host="0.0.0.0", port=8050)
+
